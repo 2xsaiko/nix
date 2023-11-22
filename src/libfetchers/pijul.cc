@@ -9,7 +9,7 @@ namespace nix::fetchers {
 struct PijulInputScheme : InputScheme
 {
     [[nodiscard]]
-    std::optional<Input> inputFromURL(const ParsedURL &url) const override
+    std::optional<Input> inputFromURL(const ParsedURL &url, bool requireTree) const override
     {
         if (url.scheme != "pijul+http" && url.scheme != "pijul+https") {
             return {};

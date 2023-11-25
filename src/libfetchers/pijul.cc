@@ -109,9 +109,17 @@ struct PijulInputScheme : InputScheme
         const auto channel = maybeGetStrAttr(input.attrs, "channel");
         const auto state = maybeGetStrAttr(input.attrs, "state");
 
+        const Attrs impureKey {
+            { "name", name },
+            { "url", repoUrl },
+        };
+
         std::optional<Attrs> key;
+        bool isLocked = false;
 
         if (channel && state) {
+            isLocked = true;
+
             key = {
                 { "name", input.getName() },
                 { "channel", *channel },
@@ -122,6 +130,15 @@ struct PijulInputScheme : InputScheme
                 auto &[infoAttrs, storePath] = *res;
                 input.attrs.insert_or_assign("lastModified", getIntAttr(infoAttrs, "lastModified"));
                 return { std::move(storePath), input };
+            }
+        }
+
+        if (auto res = getCache()->lookup(store, impureKey)) {
+            auto &[infoAttrs, storePath] = *res;
+            input.attrs.insert_or_assign("lastModified", getIntAttr(infoAttrs, "lastModified"));
+
+            if ((!channel || *channel == getStrAttr(infoAttrs, "channel")) && (!state || *state == getStrAttr(infoAttrs, "state"))) {
+                return { std::move(storePath), std::move(infoAttrs) };
             }
         }
 
@@ -168,6 +185,10 @@ struct PijulInputScheme : InputScheme
         deletePath(repoDir + "/.pijul"sv);
 
         auto storePath = store->addToStore(input.getName(), repoDir);
+
+        if (!isLocked) {
+            getCache()->add(store, impureKey, infoAttrs, storePath, false);
+        }
 
         getCache()->add(store, *key, infoAttrs, storePath, true);
 

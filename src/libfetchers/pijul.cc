@@ -62,6 +62,11 @@ struct PijulInputScheme : InputScheme
 
         Input input;
         input.attrs = attrs;
+
+        if (maybeGetStrAttr(input.attrs, "channel") && maybeGetStrAttr(input.attrs, "state")) {
+            input.locked = true;
+        }
+
         return input;
     }
 

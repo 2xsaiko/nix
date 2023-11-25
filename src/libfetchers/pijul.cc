@@ -12,6 +12,31 @@ using namespace std::string_view_literals;
 
 namespace nix::fetchers {
 
+std::string runPijul(
+    Strings args,
+    std::optional<Path> chdir = {},
+    std::optional<std::string> input = {},
+    bool isInteractive = false
+)
+{
+    auto program = "pijul"sv;
+
+    auto res = runProgram(RunOptions {
+        .program = std::string(program),
+        .searchPath = true,
+        .args = std::move(args),
+        .chdir = std::move(chdir),
+        .input = std::move(input),
+        .isInteractive = isInteractive,
+    });
+
+    if (!statusOk(res.first))
+        throw ExecError(res.first, "program '%1%' %2%", program, statusToString(res.first));
+
+    return res.second;
+}
+
+
 struct PijulInputScheme : InputScheme
 {
     [[nodiscard]]
@@ -106,6 +131,28 @@ struct PijulInputScheme : InputScheme
         Input input(_input);
         mergeAttrs(input.attrs, std::move(infoAttrs));
         return { std::move(storePath), input };
+    }
+
+    std::optional<Path> getSourcePath(const Input &input) override
+    {
+        auto url = parseURL(getStrAttr(input.attrs, "url"));
+
+        if (url.scheme == "file" && !input.getRef() && !input.getRev()) {
+            return url.path;
+        }
+
+        return {};
+    }
+
+    void markChangedFile(const Input &input, std::string_view file, std::optional<std::string> commitMsg) override
+    {
+        auto sourcePath = getSourcePath(input);
+        assert(sourcePath);
+
+        runPijul({ "add", "--", std::string(file) }, sourcePath);
+
+        if (commitMsg)
+            runPijul({ "record", std::string(file), "-m", *commitMsg }, sourcePath, {}, true);
     }
 
 private:
@@ -214,9 +261,9 @@ private:
         args.emplace_back(repoUrl);
         args.push_back(repoDir);
 
-        runProgram("pijul"s, true, args, {}, true);
+        runPijul(args, {}, {}, true);
 
-        RepoStatus rs = getRepoStatus(repoDir).value();
+        RepoStatus rs = getRepoStatus(repoDir);
 
         if (channel && *channel != rs.channel) {
             throw Error("channel mismatch: requested %s, got %s"s, *channel, rs.channel);
@@ -261,35 +308,24 @@ private:
         }
     }
 
-    static std::optional<RepoStatus> getRepoStatus(const PathView &repoPath)
+    static RepoStatus getRepoStatus(const PathView &repoPath)
     {
-        auto sp = getState(repoPath);
+        auto [state, lastModified] = getState(repoPath);
         auto channel = getRepoChannel(repoPath);
 
-        if (!sp || !channel) {
-            return {};
-        }
-
-        auto &[state, lastModified] = *sp;
-
         return RepoStatus {
-            .channel = std::move(*channel),
+            .channel = std::move(channel),
             .state = std::move(state),
             .lastModified = lastModified,
         };
     }
 
-    static std::optional<std::pair<std::string, uint64_t>> getState(const PathView &repoPath)
+    static std::pair<std::string, uint64_t> getState(const PathView &repoPath)
     {
-        const auto &[status, output] = runProgram(RunOptions {
-            .program = "pijul",
-            .args = { "log", "--output-format", "json", "--state", "--limit", "1" },
-            .chdir = Path(repoPath),
-        });
-
-        if (status != 0) {
-            return {};
-        }
+        const auto &output = runPijul(
+            { "log", "--output-format", "json", "--state", "--limit", "1" },
+            Path(repoPath)
+        );
 
         const auto &json = nlohmann::json::parse(output);
         const auto &commitInfo = json.at(0);
@@ -311,17 +347,9 @@ private:
         return res;
     }
 
-    static std::optional<std::string> getRepoChannel(const PathView &repoPath)
+    static std::string getRepoChannel(const PathView &repoPath)
     {
-        const auto &[status, output] = runProgram(RunOptions {
-            .program = "pijul",
-            .args = { "channel" },
-            .chdir = Path(repoPath),
-        });
-
-        if (status != 0) {
-            return {};
-        }
+        const auto &output = runPijul({ "channel" }, Path(repoPath));
 
         std::string::size_type pos = 0;
 
@@ -340,7 +368,7 @@ private:
             pos = nl;
         } while (pos != std::string::npos);
 
-        return {};
+        throw Error("could not parse current channel"s);
     }
 };
 

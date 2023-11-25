@@ -73,7 +73,7 @@ struct PijulInputScheme : InputScheme
     [[nodiscard]]
     bool hasAllInfo(const Input &input) const override
     {
-        return true;
+        return maybeGetIntAttr(input.attrs, "lastModified").has_value();
     }
 
     [[nodiscard]]
@@ -101,13 +101,24 @@ struct PijulInputScheme : InputScheme
         const Input &_input
     ) override
     {
+        auto [storePath, infoAttrs] = doFetch(store, _input);
+
         Input input(_input);
+        mergeAttrs(input.attrs, std::move(infoAttrs));
+        return { std::move(storePath), input };
+    }
 
+private:
+    struct RepoStatus
+    {
+        std::string channel;
+        std::string state;
+        uint64_t lastModified;
+    };
+
+    static std::pair<StorePath, Attrs> doFetch(const ref<Store> &store, const Input &input)
+    {
         const auto &name = input.getName();
-
-        const Path tmpDir = createTempDir();
-        const AutoDelete delTmpDir(tmpDir, true);
-        const auto repoDir = tmpDir + "/source"sv;
 
         const auto url = parseURL(getStrAttr(input.attrs, "url"));
         const auto &repoUrl = url.base;
@@ -115,6 +126,7 @@ struct PijulInputScheme : InputScheme
         const auto state = maybeGetStrAttr(input.attrs, "state");
 
         const Attrs impureKey {
+            { "type", "pijul" },
             { "name", name },
             { "url", repoUrl },
         };
@@ -126,45 +138,85 @@ struct PijulInputScheme : InputScheme
             isLocked = true;
 
             key = {
-                { "name", input.getName() },
+                { "type", "pijul" },
+                { "name", name },
                 { "channel", *channel },
                 { "state", *state },
             };
 
             if (auto res = getCache()->lookup(store, *key)) {
                 auto &[infoAttrs, storePath] = *res;
-                input.attrs.insert_or_assign("lastModified", getIntAttr(infoAttrs, "lastModified"));
-                return { std::move(storePath), input };
+                return { std::move(storePath), std::move(infoAttrs) };
             }
         }
 
         if (auto res = getCache()->lookup(store, impureKey)) {
             auto &[infoAttrs, storePath] = *res;
-            input.attrs.insert_or_assign("lastModified", getIntAttr(infoAttrs, "lastModified"));
 
             if ((!channel || *channel == getStrAttr(infoAttrs, "channel")) && (!state || *state == getStrAttr(infoAttrs, "state"))) {
                 return { std::move(storePath), std::move(infoAttrs) };
             }
         }
 
+        auto [storePath, rs] = doFetch(store, name, repoUrl, channel, state);
+
+        if (!key) {
+            key = {
+                { "type", "pijul" },
+                { "name", name },
+            };
+        }
+
+        mergeAttrs(*key, {
+            { "channel", rs.channel },
+            { "state", rs.state },
+        });
+
+        Attrs infoAttrs = {
+            { "channel", std::move(rs.channel) },
+            { "state", std::move(rs.state) },
+            { "lastModified", rs.lastModified },
+        };
+
+        if (!isLocked) {
+            getCache()->add(store, impureKey, infoAttrs, storePath, false);
+        }
+
+        getCache()->add(store, *key, infoAttrs, storePath, true);
+
+        return { std::move(storePath), std::move(infoAttrs) };
+    }
+
+    static std::pair<StorePath, RepoStatus> doFetch(
+        const ref<Store> &store,
+        const std::string_view &inputName,
+        const std::string_view &repoUrl,
+        const std::optional<std::string_view> &channel,
+        const std::optional<std::string_view> &state
+    )
+    {
+        const Path tmpDir = createTempDir();
+        const AutoDelete delTmpDir(tmpDir, true);
+        const auto repoDir = tmpDir + "/source"sv;
+
         Strings args { "clone"s };
 
         if (channel) {
             args.push_back("--channel"s);
-            args.push_back(*channel);
+            args.emplace_back(*channel);
         }
 
         if (state) {
             args.push_back("--state"s);
-            args.push_back(*state);
+            args.emplace_back(*state);
         }
 
-        args.push_back(repoUrl);
+        args.emplace_back(repoUrl);
         args.push_back(repoDir);
 
         runProgram("pijul"s, true, args, {}, true);
 
-        const RepoStatus rs = getRepoStatus(repoDir).value();
+        RepoStatus rs = getRepoStatus(repoDir).value();
 
         if (channel && *channel != rs.channel) {
             throw Error("channel mismatch: requested %s, got %s"s, *channel, rs.channel);
@@ -174,41 +226,40 @@ struct PijulInputScheme : InputScheme
             throw Error("state mismatch: requested %s, got %s"s, *state, rs.state);
         }
 
-        if (!key) {
-            key = {
-                { "name", input.getName() },
-                { "channel", rs.channel },
-                { "state", rs.state },
-            };
-        }
-
-        Attrs infoAttrs {
-            { "lastModified", rs.lastModified },
-            { "channel", rs.channel },
-            { "state", rs.state },
-        };
         deletePath(repoDir + "/.pijul"sv);
 
-        auto storePath = store->addToStore(input.getName(), repoDir);
+        auto storePath = store->addToStore(inputName, repoDir);
 
-        if (!isLocked) {
-            getCache()->add(store, impureKey, infoAttrs, storePath, false);
-        }
-
-        getCache()->add(store, *key, infoAttrs, storePath, true);
-
-        input.attrs.merge(infoAttrs);
-
-        return { std::move(storePath), input };
+        return { std::move(storePath), std::move(rs) };
     }
 
-private:
-    struct RepoStatus
+    static void mergeAttrs(Attrs &dest, Attrs &&source)
     {
-        std::string channel;
-        std::string state;
-        uint64_t lastModified;
-    };
+        while (true) {
+            auto next = source.begin();
+
+            if (next == source.end()) {
+                break;
+            }
+
+            auto handle = source.extract(next);
+
+            mergeOne(dest, std::move(handle.key()), std::move(handle.mapped()));
+        }
+    }
+
+    static void mergeOne(Attrs &dest, std::string key, Attr attr)
+    {
+        const auto &d = dest.find(key);
+
+        if (d != dest.end()) {
+            if (d->second != attr) {
+                throw Error("while merging attrs: value mismatch for %s", d->first);
+            }
+        } else {
+            dest.emplace(std::move(key), std::move(attr));
+        }
+    }
 
     static std::optional<RepoStatus> getRepoStatus(const PathView &repoPath)
     {

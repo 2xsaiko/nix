@@ -21,6 +21,15 @@ struct PijulInputScheme : InputScheme
 
         Attrs attrs;
         attrs.emplace("type"s, "pijul"s);
+
+        for (const auto &[name, value]: url.query) {
+            if (name == "channel" || name == "state") {
+                attrs.emplace(name, value);
+            } else {
+                url2.query.emplace(name, value);
+            }
+        }
+
         attrs.emplace("url"s, url2.to_string());
 
         return inputFromAttrs(attrs);
@@ -34,8 +43,11 @@ struct PijulInputScheme : InputScheme
         }
 
         for (const auto &[name, _]: attrs) {
-            if (name != "type" && name != "url") {
-                throw Error("unsupported Pijul input attribute '%s'", name);
+            if (
+                name != "type"sv &&
+                name != "url"sv && name != "channel"sv && name != "state"sv
+            ) {
+                throw Error("unsupported Pijul input attribute '%s'"s, name);
             }
         }
 
@@ -61,6 +73,14 @@ struct PijulInputScheme : InputScheme
             url.scheme = "pijul+"s + url.scheme;
         }
 
+        if (auto channel = maybeGetStrAttr(input.attrs, "channel"s)) {
+            url.query.insert_or_assign("channel"s, std::move(*channel));
+        }
+
+        if (auto state = maybeGetStrAttr(input.attrs, "state"s)) {
+            url.query.insert_or_assign("state"s, std::move(*state));
+        }
+
         return url;
     }
 
@@ -77,8 +97,25 @@ struct PijulInputScheme : InputScheme
 
         const auto url = parseURL(getStrAttr(input.attrs, "url"));
         const auto &repoUrl = url.base;
+        const auto channel = maybeGetStrAttr(input.attrs, "channel");
+        const auto state = maybeGetStrAttr(input.attrs, "state");
 
-        runProgram("pijul"s, true, { "clone"s, repoUrl, repoDir }, {}, true);
+        Strings args { "clone"s };
+
+        if (channel) {
+            args.push_back("--channel"s);
+            args.push_back(*channel);
+        }
+
+        if (state) {
+            args.push_back("--state"s);
+            args.push_back(*state);
+        }
+
+        args.push_back(repoUrl);
+        args.push_back(repoDir);
+
+        runProgram("pijul"s, true, args, {}, true);
         deletePath(repoDir + "/.pijul"sv);
 
         auto storePath = store->addToStore(input.getName(), repoDir);

@@ -11,7 +11,7 @@ struct PijulInputScheme : InputScheme
     [[nodiscard]]
     std::optional<Input> inputFromURL(const ParsedURL &url, bool requireTree) const override
     {
-        if (url.scheme != "pijul+http" && url.scheme != "pijul+https") {
+        if (url.scheme != "pijul+http" && url.scheme != "pijul+https" && url.scheme != "pijul+ssh") {
             return {};
         }
 

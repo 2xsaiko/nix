@@ -1,5 +1,6 @@
 #include "cache.hh"
 #include "fetchers.hh"
+#include "fetch-settings.hh"
 #include "store-api.hh"
 
 #include "toml11/toml/parser.hpp"
@@ -42,7 +43,12 @@ struct PijulInputScheme : InputScheme
     [[nodiscard]]
     std::optional<Input> inputFromURL(const ParsedURL &url, bool requireTree) const override
     {
-        if (url.scheme != "pijul+http" && url.scheme != "pijul+https" && url.scheme != "pijul+ssh") {
+        if (
+            url.scheme != "pijul+http" &&
+            url.scheme != "pijul+https" &&
+            url.scheme != "pijul+ssh" &&
+            url.scheme != "pijul+file"
+        ) {
             return {};
         }
 
@@ -126,11 +132,15 @@ struct PijulInputScheme : InputScheme
         const Input &_input
     ) override
     {
-        auto [storePath, infoAttrs] = doFetch(store, _input);
+        if (auto localPath = getSourcePath(_input)) {
+            return fetchLocal(store, _input, *localPath);
+        } else {
+            auto [storePath, infoAttrs] = doFetch(store, _input);
 
-        Input input(_input);
-        mergeAttrs(input.attrs, std::move(infoAttrs));
-        return { std::move(storePath), input };
+            Input input(_input);
+            mergeAttrs(input.attrs, std::move(infoAttrs));
+            return { std::move(storePath), input };
+        }
     }
 
     std::optional<Path> getSourcePath(const Input &input) override
@@ -278,6 +288,65 @@ private:
         auto storePath = store->addToStore(inputName, repoDir);
 
         return { std::move(storePath), std::move(rs) };
+    }
+
+    static std::pair<StorePath, Input> fetchLocal(const ref<Store> &store, const Input &_input, const std::string_view &path)
+    {
+        if (_input.attrs.contains("channel"s) || _input.attrs.contains("state"s)) {
+            throw Error("no channel/state support for local Pijul repository yet");
+        }
+
+        Input input(_input);
+
+        const std::string &diffOutput = runPijul({ "diff", "--json" }, std::string(path));
+
+        bool dirty = false;
+
+        if (!diffOutput.empty()) {
+            const auto &json = nlohmann::json::parse(diffOutput);
+
+            if (!json.empty()) {
+                dirty = true;
+            }
+        }
+
+        if (dirty) {
+            if (!fetchSettings.allowDirty) {
+                throw Error("Pijul tree '%s' is dirty", path);
+            }
+
+            if (fetchSettings.warnDirty) {
+                warn("Pijul tree '%s' is dirty", path);
+            }
+        }
+
+        auto files = tokenizeString<std::set<std::string>>(runPijul({ "list" }, std::string(path)), "\n\r");
+
+        Path actualPath(absPath(Path(path)));
+
+        PathFilter filter = [&](const Path &p) -> bool {
+            assert(hasPrefix(p, actualPath));
+            std::string file(p, actualPath.size() + 1);
+
+            auto st = lstat(p);
+
+            // TODO is this necessary? pijul tracks directories
+            if (S_ISDIR(st.st_mode)) {
+                auto prefix = file + "/";
+                auto i = files.lower_bound(prefix);
+                return i != files.end() && hasPrefix(*i, prefix);
+            }
+
+            return files.count(file);
+        };
+
+        auto storePath = store->addToStore(input.getName(), actualPath, FileIngestionMethod::Recursive, htSHA256, filter);
+
+        const auto [state, timestamp] = getState(path);
+
+        input.attrs.insert_or_assign("lastModified", timestamp);
+
+        return { std::move(storePath), input };
     }
 
     static void mergeAttrs(Attrs &dest, Attrs &&source)
